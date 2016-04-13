@@ -1,0 +1,189 @@
+#!/bin/bash -eu
+# ~/bin/listcron
+# List all cron jobs for all users on Debian
+# © 2016 Harald Rudell <c@haraldrudell.com> (http://haraldrudell.com) All rights reserved.
+
+[ "$(id -u)" -ne 0 ] && exec sudo "$(which "${BASH_SOURCE[0]}")" "$@"
+MASTERSTART="$(date +%s%N)"
+
+run() {
+  # man cron under NOTES tells you where to look:
+  displayCronDirectory "/var/spool/cron/crontabs" "user" false || return # any permissions
+  displayCronFile "/etc/crontab" "crontab" owner || return # owner: root, no go:w
+  displayCronDirectory "/etc/cron.d" "cron.d" owner || return # owner: root, no go:w
+  for AT in hourly daily weekly monthly; do
+    displayCronEntries "/etc/cron.$AT" || return
+  done
+
+  $OPT_QUIET || echo "===  $SCRIPTNAME completed successfully in $(getDuration "$MASTERSTART") s"
+}
+
+showUsage() { # $@: unparseable arguments or help 160301
+  local STATUS
+
+  STATUS=2
+  displayGreeting
+  if [ $# -gt 0 ]; then
+    if [ $# -eq 1 -a "${1:0:6}" = "--help" ]; then
+      [ "${#1}" -gt 6 ] && echo >&2 -e "${1:6}\n"
+      STATUS=0
+    else echo >&2 "Bad arguments: $*"; echo >&2
+    fi
+  fi
+
+	echo >&2 "Usage: $SCRIPTNAME [options] file"
+	echo >&2 "List all cron jobs for all users"
+	echo >&2 "  --quiet suppress display of non-essential output"
+
+	exit $STATUS
+}
+
+parseOptions() { # 160301
+  SCRIPTNAME="$(basename "${BASH_SOURCE[0]}")"
+	NAME="$(hostname):$SCRIPTNAME:$$"
+
+  OPT_QUIET=false
+	for PARAM in "$@"; do
+		case $PARAM in
+      --quiet) OPT_QUIET=true ;;
+      --help) showUsage "--help" ;;
+      *) showUsage "$@" ;;
+		esac
+		shift
+	done
+
+	$OPT_QUIET || displayGreeting
+}
+
+displayCronFile() { # filename [heading] [boolean-check-owner-mode-default-true]
+  local DOIT; local UNAME
+  local PREFIX; local LINE
+
+  DOIT=true
+  if [ "${3-}" != false ]; then
+    declare -A RESULT
+    statDereferenceNoDate "$1" || return
+    UNAME="${RESULT[uname]}"
+    if [ "$UNAME" != root ] ||
+      [ $((${RESULT[mode]} & 022)) -ne 0 ]; then DOIT=false # may not have go:w
+    fi
+  fi
+  if $DOIT; then
+    if [ $# -ge 2 ]; then PREFIX="[$2] "; else PREFIX=; fi
+    while read LINE; do
+      if [ "$LINE" -a "${LINE:0:1}" != "#" ]; then
+        echo "$PREFIX$LINE"
+      fi
+    done <"$1"
+  fi
+}
+
+displayCronDirectory() { # dir heading boolean-check-owner-mode
+  local ENTRIES; local IFS0; local ENTRY
+
+  if [ -d "$1" ]; then
+    ENTRIES="$(ls --almost-all "$1")" || return
+    IFS0="$IFS"; IFS=$'\n'; ENTRIES=($ENTRIES); IFS="$IFS0"
+    [ ${#ENTRIES[@]} -gt 0 ] && for ENTRY in "${ENTRIES[@]}"; do
+      displayCronFile "$1/$ENTRY" "$2:$(basename "$ENTRY")" "$3" || return
+    done
+  fi
+}
+
+displayCronEntries() { # dir boolean-check-owner-mode
+  local ENTRIES; local IFS0
+  local PREFIX; local ENTRY
+
+  if [ -d "$1" ]; then
+    ENTRIES="$(ls --almost-all "$1")" || return
+    IFS0="$IFS"; IFS=$'\n'; ENTRIES=($ENTRIES); IFS="$IFS0"
+    if [ ${#ENTRIES[@]} -gt 0 ]; then
+      PREFIX="$(basename "$1")"
+      for ENTRY in "${ENTRIES[@]}"; do
+        declare -A RESULT
+        statDereferenceNoDate "$1/$ENTRY" || return
+        if [ $((${RESULT[mode]} & 0100)) -ne 0 ]; then
+          echo "[$PREFIX] $ENTRY"
+        fi
+      done
+    fi
+  fi
+}
+
+statDereferenceNoDate() { # path 160301
+  local CMD; local STAT
+
+  #declare -A RESULT;
+  RESULT=() # associative array
+  CMD=(stat --dereference "$1")
+  STAT="$("${CMD[@]}")" || return
+  _statNoDate "$STAT" || return
+}
+
+_statNoDate() { # stat-result
+  local IFS0; local STAT; local STATLINE
+  local OCTMODE; local UNAME; local GNAME
+  local SIZE
+
+  IFS0="$IFS"; IFS=$'\n'; STAT=($1); IFS="$IFS0"
+  STATLINE="$(egrep "^Access: \(" <<<"$1")" || { echo >&2 "stat: No Access line: '$1'"; return 1; }
+  # Access: (0770/drwxrwx---)  Uid: (    0/    root)   Gid: ( 1028/sdcard_r)
+  STATLINE="${STATLINE#*(}"
+  OCTMODE="${STATLINE%%/*}"
+  [ "$OCTMODE" -a "${OCTMODE:0:1}" != "0" ] && OCTMODE="0$OCTMODE"
+  isOct "$OCTMODE" || return
+  RESULT[mode]=$OCTMODE
+  STATLINE="${STATLINE#*/}"
+  RESULT[type]="${STATLINE:0:1}"
+  STATLINE="${STATLINE#*/}"
+  UNAME="${STATLINE%%)*}"
+  RESULT[uname]="${UNAME##* }"
+  [ ! "${RESULT[uname]}" ] && echo >&2 "Failed to parse user name: '$STATLINE'" && return 1
+  GNAME="${STATLINE#*/}"
+  GNAME="${GNAME%%)*}"
+  RESULT[gname]="${GNAME##* }"
+  [ ! "${RESULT[gname]}" ] && echo >&2 "Failed to parse group name: '$STATLINE'" && return 1
+  SIZE="$(egrep "^  Size:" <<<"$1")" || { echo >&2 "No Size line: '$1'"; return 1; }
+  SIZE="${SIZE#*: }"
+  RESULT[size]="${SIZE%% *}"
+  isDec "${RESULT[size]}" || return
+}
+
+isOct() {
+	if [ ! "$1" -o "${1:0:1}" != "0" -o "${1/[0-7]*/}" ]; then
+    echo >&2 "String not octal: '$1'"
+    return 1
+  fi
+}
+
+isDec() {
+  [ "$1" -ge 0 ] || { [ $? -eq 2 ] && echo >&2 "Not number: '$1'"; return 1; }
+  :
+}
+
+displayGreeting() { # 160301
+  echo -e "\n\n===  $NAME $(date --date=@${MASTERSTART: -9} --rfc-3339=seconds)"
+}
+
+getDuration() { # 160223
+  # duration in s with .1 s resolution rounded down
+  local T0; local T1;
+  local DT; local DT_LENGTH
+  local RESULT
+
+  if [ $# -eq 0 ]; then RESULT="$(date +%s%N)" # time since 1970-01-01, intereger, ns resolution
+  else
+    T0="$1"
+    T1="$(date +%s%N)"
+    DT=$((T1 - T0)) # difference in ns
+    DT_LENGTH=${#DT}
+    if [ $DT_LENGTH -lt 9 ]; then RESULT="0.0" # less than .1 s
+    elif [ $DT_LENGTH -eq 9 ]; then RESULT="0.${DT:0:1}" # less than 1 s
+    else RESULT="${DT:0:$DT_LENGTH-9}.${DT:$DT_LENGTH-9:1}"
+    fi
+  fi
+
+  echo "$RESULT"
+}
+
+parseOptions "$@" && run || { X=$?; echo >&2 "$SCRIPTNAME status code: $X"; exit $X; }
